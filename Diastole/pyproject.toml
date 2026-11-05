@@ -1,0 +1,22 @@
+[project]
+name = "diastole"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Jolannn", email = "y.narkice@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "matplotlib>=3.11.2",
+    "midiutil>=1.2.1",
+    "numpy>=2.5.4",
+    "pyqt5>=5.15.11",
+]
+
+[project.scripts]
+diastole = "diastole:main"
+
+[build-system]
+requires = ["uv_build>=0.12.16,<0.13.0"]
+build-backend = "uv_build"
