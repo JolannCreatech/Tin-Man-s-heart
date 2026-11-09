@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.venv-*/
+.pytest_cache/
+.coverage
+htmlcov/
+.ruff_cache/
+
+# Generated / local assets
+assets/magenta-rt-v2/resources
+assets/magenta-rt-v2/models
+.cache/
+outputs/
+*.log
+
+# OS
+.DS_Store
