@@ -8,13 +8,14 @@ import time
 
 import soundfile as sf
 
-from diastole.config import AudioConfig, RuntimeConfig
+from diastole.config import ArrangementConfig, AudioConfig, RuntimeConfig
 from diastole.runtime.pipeline import Pipeline
 from diastole.sensors.base import StaticSensor
 
 
 def test_pipeline_mock_session(tmp_path) -> None:
     config = RuntimeConfig(
+        arrangement=ArrangementConfig(mode="legacy"),
         audio=AudioConfig(
             enabled=False, buffer_seconds=0.4, start_threshold_seconds=0.2
         ),
@@ -52,8 +53,43 @@ def test_pipeline_mock_session(tmp_path) -> None:
     assert on_disk["session"]["name"] == "pipeline_test"
 
 
+def test_pipeline_hybrid_mock_session(tmp_path) -> None:
+    """Hybrid mode renders deterministic layers and records the mix."""
+
+    config = RuntimeConfig(
+        arrangement=ArrangementConfig(mode="hybrid"),
+        audio=AudioConfig(
+            enabled=False, buffer_seconds=0.4, start_threshold_seconds=0.2
+        ),
+        duration=1.2,
+        seed=3,
+    )
+    pipeline = Pipeline(
+        config,
+        mock=True,
+        use_reference=False,
+        sensor=StaticSensor(60),
+        session_name="pipeline_hybrid",
+        output_dir=tmp_path,
+    )
+    report = pipeline.run(duration=1.2)
+
+    assert report["arrangement"]["mode"] == "hybrid"
+    assert report["arrangement"]["key"] == "Eb major"
+    assert report["validation"]["mixed_layers"] is True
+    assert report["validation"]["heartbeat_layer"] is True
+    assert report["arrangement"]["layers"]["heartbeat_beat_events"] >= 1
+    assert report["audio"]["frames"] == 30 * 1920
+    assert report["audio"]["peak"] > 0.01
+    assert report["audio"]["clipped_samples"] == 0
+    data, sr = sf.read(pipeline.paths.wav, dtype="float32", always_2d=True)
+    assert data.shape == (30 * 1920, 2)
+    assert sr == 48000
+
+
 def test_concurrent_stop_writes_report_once(tmp_path) -> None:
     config = RuntimeConfig(
+        arrangement=ArrangementConfig(mode="legacy"),
         audio=AudioConfig(
             enabled=False, buffer_seconds=0.4, start_threshold_seconds=0.2
         ),
@@ -97,6 +133,7 @@ def test_concurrent_stop_writes_report_once(tmp_path) -> None:
 
 def test_pipeline_manual_bpm_changes_processing(tmp_path) -> None:
     config = RuntimeConfig(
+        arrangement=ArrangementConfig(mode="legacy"),
         audio=AudioConfig(
             enabled=False, buffer_seconds=0.4, start_threshold_seconds=0.2
         ),

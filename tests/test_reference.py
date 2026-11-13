@@ -35,6 +35,9 @@ def _make_reference(tmp_path):
         style_offset_seconds=0.0,
         prefill_excerpt_start=0.0,
         prefill_excerpt_seconds=1.0,
+        conditioning_source="audio",
+        style_mode="drift",
+        text_style_blend=0.0,
     )
     return config
 

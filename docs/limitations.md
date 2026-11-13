@@ -25,26 +25,53 @@ limits of the current implementation.
   2.23 vs 0.05 drum-active frames/s in the final demo),
   but "high BPM sounds faster/more energetic" is an indirect, model-dependent
   effect, not a guarantee.
-- The scheduler uses a fixed 16th-note grid and a fixed pitch-class profile from
-  one MIDI transcription. It does not follow the song's actual chord changes.
+- The legacy scheduler uses a fixed 16th-note grid and a fixed pitch-class
+  profile from one MIDI transcription. The default `midi`/`hybrid` modes now
+  follow the analysed 16-bar loop's chord changes, but the loop itself is fixed
+  and repeats every 32 s; it does not follow the whole song form.
 - High energy shortens note durations, so the mean number of *overlapping* notes
   can be lower at high BPM even though onsets are much more frequent. Event rate
   is the meaningful response metric.
 
+## Iteration-2 musical layers
+
+- The MIDI is a **Basic Pitch transcription**, not a score. It merges vocals and
+  accompaniment into one track; there is no verified vocal/instrumental split.
+  116 of 761 notes are non-diatonic and the upper voice is noisy. The extracted
+  theme is a cleaned best effort, not a faithful melody.
+- Harmonic analysis uses a diatonic-triad vocabulary. It will mislabel borrowed
+  chords, inversions and short passing harmony. Low-confidence chords
+  (~0.50) are treated as passing material.
+- The selected loop (bars 44–59, Eb–Ab–Bb–Eb) is 32 s long and repeats. Longer
+  sessions will sound cyclical unless a future version switches loops.
+- The heartbeat is a fixed lub-dub/pulse pattern quantised to the live BPM. It
+  is stable and exact, but it is not expressive: there is no swing, human
+  timing, or physiological beat-to-beat variation beyond the smoothed BPM.
+- The instrumental render uses a tiny additive numpy synth. It is clean and
+  deterministic but deliberately simple; it is not a realistic piano/string
+  sample library.
+- MRT2 still colours the result and can still produce vocal-like or unstable
+  artefacts. The redesign removes the lead melody and drum pulse from its
+  conditioning and conditions it on an instrumental render, which reduces but
+  does not eliminate the problem.
+- The agent cannot subjectively hear audio. All claims here are numerical or
+  structural; final musical acceptance requires a human listener.
+
 ## Reference song
 
-- The recording is never mixed in, but its influence is indirect:
+- The recording is never mixed in, and the default conditioning source is now
+  an **instrumental rendering of the MIDI transcription**, not the MP3. The MP3
+  remains available for comparison and for the `--conditioning audio` ablation.
+- Influence is still indirect:
   - 12-token MusicCoCa windows are coarse style descriptors.
-  - The prefill seeds a 28 s excerpt (15–43 s of the song). A longer session
+  - The prefill seeds a 28 s excerpt of the 48 s MIDI render. A longer session
     drifts away from that context; there is no re-prefill or sliding audio
     context.
-  - The default session walks the song at 1× from offset 0, so a 42 s run uses
-    only the first ~42 s of the 170.5 s recording. The full set of 35 windows is
-    cached for longer runs.
+  - The loop repeats, so style windows derived from a longer render also repeat.
 - The generated output is not expected to quote or reproduce the song's melody.
   Reference conditioning is a bias, not source separation or transcription.
-- The pitch profile comes from a prior `basic_pitch_transcription.mid`; its
-  accuracy is not validated here.
+- The pitch profile comes from `basic_pitch_transcription.mid`; its accuracy is
+  not validated here (see `MIDI_ANALYSIS.md`).
 
 ## Model / runtime
 
@@ -66,12 +93,17 @@ limits of the current implementation.
   block, and unmeasured CoreAudio/device latency. The practical delay from
   control change to speaker is therefore on the order of **1.3–1.5 s**, not
   25 ms. This is a deliberate stability trade-off, not a low-latency instrument.
-- The buffered tail is not drained on stop (`drain_on_stop` is reserved but
-  unused). In the 42 s run, 1,954,560 frames were played from 2,017,920 recorded
-  frames: about 1.3 s remains in the ring/WAV at shutdown and is not heard.
-- There is no output limiter or normalization. Observed peaks ranged from 0.78
-  to 0.98 across runs (no clipped samples, but close to full scale); other
-  settings could clip. The WAV is written as PCM16.
+- The heartbeat and accompaniment are rendered in the playback thread, so they
+  continue through inference stalls; MRT2 itself will simply hold its last
+  buffered material. A sustained underrun still affects only the MRT2 layer.
+- On stop, the buffered tail is now drained and recorded
+  (`drain_on_stop=True`), so the WAV includes the material that was queued for
+  playback.
+- The output path has a smoothed per-layer mix, a master gain, an
+  instant-attack/smooth-release limiter and a hard clip guard. The 12 s real
+  hybrid check had peak 0.654 and 0 clipped samples. This is a safety net, not
+  an artistic mastering chain, and it does not guarantee perceived loudness or
+  spectral balance.
 - Underruns are faded rather than clicked, but a sustained underrun would still
   be audible as dropout. The acceptance run had zero underruns.
 - Startup has a ~0.4 s pre-roll/device-start handoff gap in generation metrics;

@@ -15,8 +15,10 @@ from rich.table import Table
 from diastole import __version__
 from diastole.config import (
     DEFAULT_OUTPUT_DIR,
+    ArrangementConfig,
     AudioConfig,
     EngineConfig,
+    MixConfig,
     ReferenceConfig,
     RuntimeConfig,
 )
@@ -43,6 +45,20 @@ def _build_config(
     cfg_notes: float,
     cfg_musiccoca: float,
     cfg_drums: float,
+    mode: str = "hybrid",
+    heartbeat: bool = True,
+    heartbeat_pattern: str = "heartbeat",
+    heartbeat_gain: float = 0.62,
+    accompaniment_gain: float = 0.34,
+    mrt2_gain: float = 0.52,
+    reference_gain: float = 0.0,
+    master_gain: float = 0.92,
+    ducking: float = 0.0,
+    conditioning: str = "midi",
+    style_mode: str = "fixed",
+    text_style: str | None = None,
+    text_blend: float = 0.65,
+    loop_bars: int = 16,
 ) -> RuntimeConfig:
     engine = EngineConfig(
         model_size=model,
@@ -54,8 +70,32 @@ def _build_config(
         prefill=prefill,
     )
     audio_cfg = AudioConfig(enabled=audio, buffer_seconds=buffer_seconds)
+    default_text = ReferenceConfig().text_style
+    arrangement = ArrangementConfig(
+        mode=mode,
+        heartbeat=heartbeat,
+        heartbeat_pattern=heartbeat_pattern,
+        loop_bars=loop_bars,
+    )
+    mix = MixConfig(
+        heartbeat_gain=heartbeat_gain,
+        accompaniment_gain=accompaniment_gain,
+        mrt2_gain=mrt2_gain,
+        reference_gain=reference_gain,
+        master_gain=master_gain,
+        ducking=ducking,
+    )
+    reference = ReferenceConfig(
+        conditioning_source=conditioning,
+        style_mode=style_mode,
+        text_style=default_text if text_style is None else text_style,
+        text_style_blend=text_blend,
+    )
     return RuntimeConfig(
         engine=engine,
+        reference=reference,
+        arrangement=arrangement,
+        mix=mix,
         audio=audio_cfg,
         scenario=scenario,
         duration=duration,
@@ -77,6 +117,7 @@ def _print_summary(report: dict) -> None:
     table.add_column("Item")
     table.add_column("Result", justify="right")
     table.add_row("Session", report["session"]["name"])
+    table.add_row("Mode", report["validation"].get("mode", "legacy"))
     table.add_row("Audio length", f"{report['session']['audio_seconds']:.1f} s")
     table.add_row("BPM range", f"{bpm['min']:.1f} – {bpm['max']:.1f}")
     table.add_row("Tempo range", f"{mus['tempo_min']:.1f} – {mus['tempo_max']:.1f}")
@@ -198,6 +239,42 @@ def main() -> None:
 @click.option("--cfg-notes", type=float, default=2.0, show_default=True)
 @click.option("--cfg-musiccoca", type=float, default=3.0, show_default=True)
 @click.option("--cfg-drums", type=float, default=1.0, show_default=True)
+@click.option(
+    "--mode",
+    type=click.Choice(["legacy", "midi", "hybrid"]),
+    default="hybrid",
+    show_default=True,
+    help="legacy=iteration-1 timeline, midi=MIDI accompaniment, hybrid=both+heartbeat.",
+)
+@click.option("--no-heartbeat", is_flag=True, help="Disable the deterministic heartbeat layer.")
+@click.option(
+    "--heartbeat-pattern",
+    type=click.Choice(["heartbeat", "pulse", "kick"]),
+    default="heartbeat",
+    show_default=True,
+)
+@click.option("--heartbeat-gain", type=float, default=0.62, show_default=True)
+@click.option("--accompaniment-gain", type=float, default=0.34, show_default=True)
+@click.option("--mrt2-gain", type=float, default=0.52, show_default=True)
+@click.option("--reference-gain", type=float, default=0.0, show_default=True)
+@click.option("--master-gain", type=float, default=0.92, show_default=True)
+@click.option("--ducking", type=float, default=0.0, show_default=True)
+@click.option(
+    "--conditioning",
+    type=click.Choice(["midi", "audio"]),
+    default="midi",
+    show_default=True,
+    help="Condition MRT2 on the MIDI render or the original recording.",
+)
+@click.option(
+    "--style-mode",
+    type=click.Choice(["fixed", "drift", "loop"]),
+    default="fixed",
+    show_default=True,
+)
+@click.option("--text-style", default=None, help="MusicCoCa style text (MIDI conditioning).")
+@click.option("--text-blend", type=float, default=0.65, show_default=True)
+@click.option("--loop-bars", type=int, default=16, show_default=True)
 def run(**kwargs: object) -> None:
     """Run a live heart-rate-conditioned session."""
 
@@ -216,6 +293,20 @@ def run(**kwargs: object) -> None:
         cfg_notes=kwargs["cfg_notes"],
         cfg_musiccoca=kwargs["cfg_musiccoca"],
         cfg_drums=kwargs["cfg_drums"],
+        mode=kwargs["mode"],
+        heartbeat=not kwargs["no_heartbeat"],
+        heartbeat_pattern=kwargs["heartbeat_pattern"],
+        heartbeat_gain=kwargs["heartbeat_gain"],
+        accompaniment_gain=kwargs["accompaniment_gain"],
+        mrt2_gain=kwargs["mrt2_gain"],
+        reference_gain=kwargs["reference_gain"],
+        master_gain=kwargs["master_gain"],
+        ducking=kwargs["ducking"],
+        conditioning=kwargs["conditioning"],
+        style_mode=kwargs["style_mode"],
+        text_style=kwargs["text_style"],
+        text_blend=kwargs["text_blend"],
+        loop_bars=kwargs["loop_bars"],
     )
     _execute(
         config,
@@ -268,6 +359,271 @@ def demo(**kwargs: object) -> None:
         interactive=False,
         initial_bpm=None,
     )
+
+
+# Controlled comparison used for the iteration-2 evaluation.  The ladder moves
+# one variable at a time: iteration-1 baseline -> deterministic MIDI material ->
+# heartbeat -> MIDI-rendered conditioning -> the full hybrid.
+_EXPERIMENTS: dict[str, dict] = {
+    "A": {
+        "label": "baseline",
+        "note": "Iteration-1 baseline: MRT2 from the audio reference, no heartbeat or MIDI material.",
+        "mode": "legacy",
+        "heartbeat": False,
+        "conditioning": "audio",
+        "style_mode": "drift",
+        "text_blend": 0.0,
+        "heartbeat_gain": 0.0,
+        "accompaniment_gain": 0.0,
+        "mrt2_gain": 0.52,
+        "reference": True,
+    },
+    "B": {
+        "label": "midi_material",
+        "note": "MIDI analysis only: deterministic instrumental arrangement, no MRT2 or heartbeat.",
+        "mode": "midi",
+        "heartbeat": False,
+        "conditioning": "audio",
+        "style_mode": "fixed",
+        "text_blend": 0.0,
+        "heartbeat_gain": 0.0,
+        "accompaniment_gain": 0.95,
+        "mrt2_gain": 0.0,
+        "reference": False,
+    },
+    "C": {
+        "label": "heartbeat_mrt2",
+        "note": "Heartbeat + the iteration-1 MRT2 timeline, audio conditioning.",
+        "mode": "legacy",
+        "heartbeat": True,
+        "conditioning": "audio",
+        "style_mode": "drift",
+        "text_blend": 0.0,
+        "heartbeat_gain": 0.62,
+        "accompaniment_gain": 0.0,
+        "mrt2_gain": 0.52,
+        "reference": True,
+    },
+    "D": {
+        "label": "midi_conditioning",
+        "note": "Iteration-1 MRT2 timeline conditioned on the instrumental MIDI render + style text.",
+        "mode": "legacy",
+        "heartbeat": False,
+        "conditioning": "midi",
+        "style_mode": "fixed",
+        "text_blend": 0.55,
+        "heartbeat_gain": 0.0,
+        "accompaniment_gain": 0.0,
+        "mrt2_gain": 0.52,
+        "reference": True,
+    },
+    "E": {
+        "label": "full_hybrid",
+        "note": "Full hybrid: heartbeat + MIDI accompaniment + MRT2 conditioned on the MIDI render.",
+        "mode": "hybrid",
+        "heartbeat": True,
+        "conditioning": "midi",
+        "style_mode": "fixed",
+        "text_blend": 0.65,
+        "heartbeat_gain": 0.62,
+        "accompaniment_gain": 0.34,
+        "mrt2_gain": 0.50,
+        "reference": True,
+    },
+}
+
+
+@main.command()
+@click.option("--duration", type=float, default=15.0, show_default=True)
+@click.option("--out", type=click.Path(file_okay=False), default=None)
+@click.option("--model", default="mrt2_small", show_default=True)
+@click.option("--seed", type=int, default=7, show_default=True)
+@click.option("--bpm", type=float, default=70.0, show_default=True, help="Fixed BPM for controlled comparison.")
+@click.option("--no-audio", is_flag=True, help="Record WAVs without opening a device.")
+@click.option("--mock", is_flag=True, help="Use the oscillator engine (runner check only).")
+@click.option("--only", default=None, help="Comma-separated experiment keys, e.g. A,C,E.")
+def experiments(
+    duration: float,
+    out: str | None,
+    model: str,
+    seed: int,
+    bpm: float,
+    no_audio: bool,
+    mock: bool,
+    only: str | None,
+) -> None:
+    """Run controlled experiments A-E and write audio/report/metrics per run."""
+
+    keys = (
+        [k.strip().upper() for k in only.split(",") if k.strip()]
+        if only
+        else list(_EXPERIMENTS)
+    )
+    unknown = [k for k in keys if k not in _EXPERIMENTS]
+    if unknown:
+        raise click.BadParameter(f"unknown experiment(s): {', '.join(unknown)}")
+
+    root = Path(out) if out else DEFAULT_OUTPUT_DIR / "experiments"
+    root.mkdir(parents=True, exist_ok=True)
+    rows: list[dict] = []
+
+    for key in keys:
+        spec = _EXPERIMENTS[key]
+        console.rule(f"[bold]Experiment {key} — {spec['label']}[/bold]")
+        console.print(f"[grey62]{spec['note']}[/grey62]")
+        config = _build_config(
+            model=model,
+            scenario="manual",
+            duration=duration,
+            out=str(root),
+            mock=False,
+            audio=not no_audio,
+            prefill=True,
+            buffer_seconds=1.6,
+            seed=seed,
+            temperature=1.1,
+            top_k=50,
+            cfg_notes=2.0,
+            cfg_musiccoca=3.0,
+            cfg_drums=1.0,
+            mode=spec["mode"],
+            heartbeat=spec["heartbeat"],
+            heartbeat_gain=spec["heartbeat_gain"],
+            accompaniment_gain=spec["accompaniment_gain"],
+            mrt2_gain=spec["mrt2_gain"],
+            ducking=0.0,
+            conditioning=spec["conditioning"],
+            style_mode=spec["style_mode"],
+            text_blend=spec["text_blend"],
+            loop_bars=16,
+        )
+        try:
+            report = _execute(
+                config,
+                session_name=f"exp_{key}_{spec['label']}",
+                mock=mock,
+                use_reference=spec["reference"],
+                dashboard=False,
+                interactive=False,
+                initial_bpm=bpm,
+            )
+        except Exception as exc:
+            console.print(f"[red]Experiment {key} failed: {type(exc).__name__}: {exc}[/red]")
+            rows.append({"key": key, "label": spec["label"], "error": str(exc)})
+            continue
+
+        row = _experiment_metrics(key, spec, report)
+        row["wav"] = report["paths"]["wav"]
+        row["report"] = report["paths"]["report_json"]
+        rows.append(row)
+
+        # Keep the instrumental reference next to the mix for auditioning.
+        rendered = (report.get("reference") or {}).get("rendered_audio")
+        if rendered and Path(rendered).exists():
+            import shutil
+
+            stem = root / f"exp_{key}_{spec['label']}_midi_render.wav"
+            shutil.copyfile(rendered, stem)
+            row["midi_render"] = str(stem)
+
+    _write_experiment_summary(root, rows, duration, seed, bpm)
+    _print_experiment_table(rows)
+    console.print(f"[grey62]Artifacts: {root}[/grey62]")
+
+
+def _experiment_metrics(key: str, spec: dict, report: dict) -> dict:
+    audio = report.get("audio", {})
+    buffer = report.get("buffer", {})
+    latency = report.get("latency_ms", {})
+    musical = report.get("musical", {})
+    arrangement = report.get("arrangement", {})
+    layers = arrangement.get("layers") or {}
+    return {
+        "key": key,
+        "label": spec["label"],
+        "mode": spec["mode"],
+        "conditioning": spec["conditioning"],
+        "heartbeat": spec["heartbeat"],
+        "bpm": round(float(report.get("bpm", {}).get("mean", 0.0)), 2),
+        "audio_seconds": round(float(report.get("session", {}).get("audio_seconds", 0.0)), 2),
+        "peak": round(float(audio.get("peak", 0.0)), 4),
+        "rms": round(float(audio.get("rms", 0.0)), 4),
+        "clipped_samples": int(audio.get("clipped_samples", 0)),
+        "onset_rate_hz": round(float(musical.get("onset_rate_hz", 0.0)), 3),
+        "underruns": int(buffer.get("underruns", 0)),
+        "dropped_frames": int(buffer.get("dropped_frames", 0)),
+        "mean_latency_ms": round(float(latency.get("mean", 0.0)), 2),
+        "p95_latency_ms": round(float(latency.get("p95", 0.0)), 2),
+        "limiter_reductions": int(layers.get("limiter_reductions", 0)),
+        "heartbeat_beats": int(layers.get("heartbeat_beat_events", 0)),
+        "analysis_key": arrangement.get("key", "n/a"),
+    }
+
+
+def _write_experiment_summary(
+    root: Path, rows: list[dict], duration: float, seed: int, bpm: float
+) -> None:
+    summary = {
+        "duration_seconds": duration,
+        "seed": seed,
+        "fixed_bpm": bpm,
+        "experiments": rows,
+    }
+    path = root / "summary.json"
+    path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    lines = [
+        "# Experiments A–E",
+        "",
+        f"Duration {duration:.1f} s per run, seed {seed}, fixed manual BPM {bpm:.0f}.",
+        "",
+        "| Exp | Configuration | Mode | BPM | Peak | RMS | Onsets/s | Clips | Underruns |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    for row in rows:
+        if "error" in row:
+            lines.append(f"| {row['key']} | {row['label']} | failed | — | — | — | — | — | — |")
+            continue
+        lines.append(
+            "| {key} | {label} | {mode} | {bpm:.1f} | {peak:.3f} | {rms:.3f} | "
+            "{onset_rate_hz:.2f} | {clipped_samples} | {underruns} |".format(**row)
+        )
+    lines += [
+        "",
+        "## Listening notes",
+        "",
+        "_Fill in after auditioning each WAV (the agent cannot evaluate audio subjectively)._",
+        "",
+    ]
+    (root / "EXPERIMENTS.md").write_text("\n".join(lines), encoding="utf-8")
+
+
+def _print_experiment_table(rows: list[dict]) -> None:
+    table = Table(title="Experiments A–E", header_style="bold cyan")
+    table.add_column("Exp")
+    table.add_column("Configuration")
+    table.add_column("Mode")
+    table.add_column("BPM", justify="right")
+    table.add_column("Peak", justify="right")
+    table.add_column("RMS", justify="right")
+    table.add_column("Onsets/s", justify="right")
+    table.add_column("Clips", justify="right")
+    table.add_column("Underruns", justify="right")
+    for row in rows:
+        if "error" in row:
+            table.add_row(row["key"], row["label"], "failed", "—", "—", "—", "—", "—", "—")
+            continue
+        table.add_row(
+            row["key"],
+            row["label"],
+            row["mode"],
+            f"{row['bpm']:.1f}",
+            f"{row['peak']:.3f}",
+            f"{row['rms']:.3f}",
+            f"{row['onset_rate_hz']:.2f}",
+            str(row["clipped_samples"]),
+            str(row["underruns"]),
+        )
+    console.print(table)
 
 
 @main.command()

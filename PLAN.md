@@ -4,8 +4,11 @@
 The system must continuously generate audio influenced by both (a) the user's heart
 rate and (b) the original recording of *“If I Only Had a Heart”*.
 
-**Status: complete and verified end-to-end** (Python/MLX path). See §7 for acceptance
-evidence and `docs/limitations.md` for what is not claimed.
+**Status: iteration 1 complete and verified end-to-end** (Python/MLX path).
+**Iteration 2** (MIDI-driven musical identity + deterministic heartbeat + mixer)
+is implemented; controlled A–E experiments are in `EXPERIMENTS.md`. See §7 for
+iteration-1 acceptance evidence, §8 for iteration 2, and `docs/limitations.md`
+for what is not claimed.
 
 Status legend: `[x]` done · `[~]` in progress · `[ ]` not started · `[!]` blocked.
 
@@ -26,7 +29,7 @@ Status legend: `[x]` done · `[~]` in progress · `[ ]` not started · `[!]` blo
 | C++ build | blocked: active tools are Command Line Tools only; `xcrun: unable to find utility "metal"`, no full Xcode, no passwordless sudo. Not on the critical path. |
 | Real-time result | `mrt2_small` generated 42.0 s continuously at 25.4 ms/frame mean, 28.6 ms p95 (40 ms budget), 0 underruns, 0 dropped frames; `sounddevice`/CoreAudio output verified. |
 | Prefill result | 650 SpectroStream tokens; 26.4 s one-time compute; 165-array state cached and loaded in ~0.013 s; output differs materially from a cold start. |
-| Test result | `uv run pytest -q`: 44 passed in ~3 s (mock engine, no model load). |
+| Test result | `uv run pytest -q`: 44 passed in ~3 s (mock engine, no model load) after iteration 1; **54 passed** after iteration 2 (adds MIDI/mixer/synth/arranger coverage). |
 | Reference music | `~/Downloads/The Wizard Of Oz - If I Only Had A Heart.mp3`, 170.5 s, 44.1 kHz stereo, 192 kbps |
 | Reference MIDI | prior branch `Diastole`: `basic_pitch_transcription.mid` (format 1, 480 PPQ) and `major-scale.mid` |
 | Audio output | `sounddevice` with CoreAudio works directly (MacBook Pro Speakers, device index 1); no Homebrew PortAudio package was needed. `afconvert`/`afplay` also exist. A paced simulated sink is used with `--no-audio` or when no device opens. |
@@ -138,8 +141,8 @@ input ─────────▶ │   SimulatedHeartRateSensor (thread)    
   `sounddevice.OutputStream.write()`; it never runs inference.
 - **CLI/dashboard thread (main)** only reads metrics and writes control commands.
 - Target buffer 1.6 s (85% fill target); underruns produce a short fade instead of a click.
-- Graceful stop: stop generation, join threads, stop playback, flush WAV/MIDI and reports.
-  The buffered tail is not drained (see limitations).
+- Graceful stop: stop generation, join threads, stop playback, drain and record the
+  buffered tail, flush WAV/MIDI and reports.
 
 ---
 
@@ -299,9 +302,9 @@ Acceptance evidence (final 42 s run, `outputs/final_demo/`):
 5. Inference averaged 25.4 ms/frame (p95 28.6 ms) against a 40 ms budget, with
    0 underruns and 0 dropped frames. One outlier frame took 53.9 ms; the 1.6 s
    buffer absorbed it.
-6. Ctrl-C/`stop` path joins threads and flushes artifacts; the buffered tail is
-   intentionally not drained.
-7. `uv run pytest -q` → 44 passed.
+6. Ctrl-C/`stop` path joins threads and flushes artifacts. (Iteration 2 also
+   drains and records the buffered tail; see §8.)
+7. `uv run pytest -q` → 44 passed in iteration 1, 54 in iteration 2.
 8. Documentation: `README.md`, this plan, `IMPLEMENTATION_LOG.md` and `docs/`.
 
 Remaining blocked item: the optional C++ Magenta runtime build (no Metal
@@ -309,4 +312,87 @@ compiler). It is not required for the delivered prototype.
 
 Remaining limitations are recorded in `docs/limitations.md`; the main ones are
 the simulated-only sensor, indirect/non-guaranteed musical response, ~1.3 s
-playback latency from buffering, and the undrained tail on stop.
+playback latency from buffering, and (in iteration 1) the undrained tail on
+stop. Iteration 2 drains the tail and adds a limiter; iteration-2 limitations
+are listed in §8 and `docs/limitations.md`.
+
+---
+
+## 8. Iteration 2 — MIDI identity, deterministic pulse, layered mix
+
+**Goal:** keep the working prototype but replace the chaotic, vocal-leaning
+MRT2 output with a coherent arrangement built from three separable layers:
+
+1. **Layer A — heartbeat:** BPM-exact, rendered in the playback thread, stable
+   even when inference stalls.
+2. **Layer B — MRT2:** reduced to complementary harmonic/textural material,
+   conditioned on an instrumental MIDI render rather than the vocal MP3.
+3. **Layer C — MIDI accompaniment:** bass/pad/lead derived from the
+   transcription, schedule-locked to the live BPM.
+
+The MIDI file is the primary musical reference; the MP3 is comparison-only and
+is never mixed into the output.
+
+### Phase 9 — MIDI analysis and material extraction
+- [x] Parse SMF, tempo map (fixed end-tick inversion), time signature, programs.
+- [x] Key estimation (Krumhansl), bass-anchored diatonic Viterbi chords, bars.
+- [x] Automatic 16-bar loop selection (bars 44–59) and cleaned theme.
+- [x] Diagnostics + `midi_analysis.json` per session.
+- [x] Unit tests on the real transcription.
+
+### Phase 10 — Offline instrumental rendering
+- [x] Self-contained numpy synth (bass/pad/lead), no FluidSynth/SoundFont.
+- [x] Deterministic render + cache (`midi_render_*.wav`).
+- [x] Loop material shared with the live arranger.
+
+### Phase 11 — BPM-locked arranger and real-time layers
+- [x] `MidiArranger` walks the beat clock and emits sample-accurate events.
+- [x] `AccompanimentSynth` (pending pre-rendered voices).
+- [x] `HeartbeatSynth` rendered in the playback thread from live BPM.
+- [x] Heartbeat also available in `legacy` mode for the C ablation.
+- [x] Unit tests for beat integration and heartbeat exactness.
+
+### Phase 12 — Mixer, playback and recording
+- [x] `SmoothedGain`, instant-attack `Limiter`, `LayerMixer` with per-layer
+      gains, optional ducking, optional reference layer, clip guard.
+- [x] Playback-thread processor + recorder; periodic flush; drain on stop.
+- [x] WAV now captures the actual mixed output.
+- [x] Unit tests for gains, limiter and reference routing.
+
+### Phase 13 — Conditioning on the MIDI render
+- [x] `ReferenceConfig.conditioning_source` (`midi` default, `audio` ablation).
+- [x] MusicCoCa style windows from the instrumental render.
+- [x] SpectroStream prefill from the render.
+- [x] Text/audio style blend before tokenisation (fixed float32 dtype bug).
+- [x] Style modes `fixed` / `drift` / `loop`.
+
+### Phase 14 — CLI, experiments and documentation
+- [x] CLI modes `legacy|midi|hybrid`, per-layer gains, conditioning options.
+- [x] `diastole experiments` runner for A–E with audio/report/metrics/stems.
+- [~] Run controlled A–E experiments and record listening notes.
+- [x] `MIDI_ANALYSIS.md`, `AUDIO_INVESTIGATION.md`, `EXPERIMENTS.md`.
+- [x] Update README, limitations and implementation log.
+
+### Iteration-2 acceptance criteria
+1. A real-MRT2 hybrid session is continuous, non-silent, has 0 underruns and
+   0 clipped samples, and records the mixed output. **Evidence:** 20 s audible
+   `sounddevice` run in `outputs/final_playback/`, peak 0.628, RMS 0.076,
+   0 underruns, 0 clipped.
+2. The heartbeat layer advances independently of inference at the live BPM.
+   **Evidence:** heartbeat-only capture median interval 0.7812 s vs expected
+   0.78125 s (CV 0.00013); final run 26 beat events, 0.7951 s vs 0.7947 s.
+3. MIDI-derived accompaniment is BPM-locked and uses the analysed loop.
+   **Evidence:** `MidiArranger` tests at 60/120 BPM; B/E runs at fixed 70 BPM
+   with 1.86 onsets/s and 10 style windows from the MIDI render.
+4. MRT2 is conditioned on the instrumental MIDI render (style + prefill) by
+   default and no longer receives the lead melody or drum pulse.
+   **Evidence:** 10 style windows and MIDI-render prefill in D/E; conditioning
+   timeline reduced to bass + pad.
+5. A–E runs are saved with comparable metrics and representative audio.
+   **Evidence:** `outputs/experiments_fixed/summary.json` and `EXPERIMENTS.md`.
+6. Tests cover every new component and the full suite passes.
+   **Evidence:** `uv run pytest -q` → 54 passed.
+7. Limitations are updated honestly, including the inability of the agent to
+   judge musical quality without a listener. **Evidence:**
+   `docs/limitations.md`; the listening table in `EXPERIMENTS.md` is left for
+   a human.

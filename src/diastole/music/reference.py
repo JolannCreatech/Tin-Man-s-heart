@@ -75,7 +75,14 @@ def load_audio(path: str | Path, sample_rate: int = cfg.SAMPLE_RATE) -> tuple[np
 
 
 class ReferenceMusic:
-    """Loader, style-window cache, prefill cache and pitch profile."""
+    """Loader, style-window cache, prefill cache and pitch profile.
+
+    The conditioning source can be the original recording (``audio``), which is
+    only useful for comparison, or an instrumental rendering of the MIDI
+    transcription (``midi``).  The latter is the default for iteration 2: it
+    keeps the harmonic identity of the song but removes the vocals and the
+    noisy mix from the conditioning signal.
+    """
 
     def __init__(self, config: ReferenceConfig | None = None) -> None:
         self.config = config or ReferenceConfig()
@@ -87,14 +94,24 @@ class ReferenceMusic:
         self._prefill_tokens: np.ndarray | None = None
         self._prefill_meta: dict = {}
         self._prefill_state_path: Path | None = None
+        self._analysis = None
+        self._render_path: Path | None = None
         self.prefill_cache_hit: bool | None = None
         self.prefill_load_seconds = 0.0
         self.prefill_compute_seconds = 0.0
-        self._identity = _file_identity(Path(self.config.audio_path))
+        if self.config.conditioning_source == "midi":
+            identity = _file_identity(Path(self.config.midi_path))
+            identity += f":render={self.config.midi_render_seconds}"
+        else:
+            identity = _file_identity(Path(self.config.audio_path))
+        self._identity = identity
         self._style_digest = _digest(
             self._identity,
             self.config.style_clip_seconds,
             self.config.style_hop_seconds,
+            self.config.style_mode,
+            self.config.text_style if self.config.conditioning_source == "midi" else "",
+            self.config.text_style_blend,
         )
         self._prefill_digest = _digest(
             self._identity,
@@ -103,6 +120,11 @@ class ReferenceMusic:
             self.config.prefill_normalize_peak,
         )
         Path(self.config.cache_dir).mkdir(parents=True, exist_ok=True)
+
+    def set_analysis(self, analysis) -> None:
+        """Share the pipeline's MIDI analysis with the reference loader."""
+
+        self._analysis = analysis
 
     # -- audio ------------------------------------------------------------
     @property
@@ -121,7 +143,24 @@ class ReferenceMusic:
         return len(self.audio) / self.sample_rate
 
     def load_audio(self) -> np.ndarray:
-        self._audio, self._audio_sr = load_audio(self.config.audio_path)
+        if self.config.conditioning_source == "midi":
+            from diastole.music.midi_analysis import analyze_midi
+            from diastole.music.midi_render import load_or_render
+
+            if self._analysis is None:
+                self._analysis = analyze_midi(self.config.midi_path)
+            audio, path = load_or_render(
+                self._analysis,
+                seconds=float(self.config.midi_render_seconds),
+                sample_rate=cfg.SAMPLE_RATE,
+                directory=self.config.midi_render_cache,
+                progress=None,
+            )
+            self._audio = audio
+            self._audio_sr = cfg.SAMPLE_RATE
+            self._render_path = path
+        else:
+            self._audio, self._audio_sr = load_audio(self.config.audio_path)
         return self._audio
 
     # -- pitch profile ----------------------------------------------------
@@ -175,9 +214,31 @@ class ReferenceMusic:
             pool_across_time=False,
             hop_length=float(self.config.style_hop_seconds),
         )
-        embeddings = np.asarray(embeddings)
+        embeddings = np.asarray(embeddings, dtype=np.float64)
         if embeddings.ndim == 2:
             embeddings = embeddings[np.newaxis, ...]
+
+        blend = float(min(1.0, max(0.0, self.config.text_style_blend)))
+        if self.config.conditioning_source == "midi" and blend > 0 and self.config.text_style:
+            if progress:
+                progress(f"Embedding style text: {self.config.text_style!r}")
+            text = model.embed(
+                self.config.text_style,
+                use_mapper=True,
+                seed=int(self.config.text_style_seed),
+            )
+            text = np.asarray(text, dtype=np.float64).reshape(1, -1)
+            audio_n = embeddings / np.maximum(
+                1e-9, np.linalg.norm(embeddings, axis=-1, keepdims=True)
+            )
+            text_n = text / max(1e-9, float(np.linalg.norm(text)))
+            merged = (1.0 - blend) * audio_n + blend * text_n
+            embeddings = merged / np.maximum(
+                1e-9, np.linalg.norm(merged, axis=-1, keepdims=True)
+            )
+
+        # MusicCoCa's tflite tokenizer expects float32 input.
+        embeddings = np.ascontiguousarray(embeddings, dtype=np.float32)
         tokens = np.asarray(model.tokenize(embeddings[0]), dtype=np.int32)
         starts = np.arange(tokens.shape[0], dtype=np.float64) * float(
             self.config.style_hop_seconds
@@ -197,11 +258,17 @@ class ReferenceMusic:
         tokens = self.style_tokens
         if tokens.shape[0] == 0:
             raise RuntimeError("Reference style token cache is empty")
-        song_time = (
-            float(self.config.style_offset_seconds)
-            + float(self.config.style_speed) * max(0.0, float(session_time))
-        ) % max(1e-6, self.duration)
-        index = int(song_time // max(1e-6, self.config.style_hop_seconds))
+        hop = max(1e-6, self.config.style_hop_seconds)
+        mode = self.config.style_mode
+        if mode == "fixed":
+            song_time = max(0.0, float(self.config.style_position_seconds))
+        else:
+            song_time = (
+                float(self.config.style_offset_seconds)
+                + float(self.config.style_speed) * max(0.0, float(session_time))
+            )
+            song_time = song_time % max(1e-6, self.duration)
+        index = int(song_time // hop)
         return min(tokens.shape[0] - 1, max(0, index))
 
     def style_tokens_at(self, session_time: float) -> list[int]:
@@ -368,7 +435,17 @@ class ReferenceMusic:
             "cache_dir": str(self.config.cache_dir),
             "style_clip_seconds": self.config.style_clip_seconds,
             "style_hop_seconds": self.config.style_hop_seconds,
+            "conditioning_source": self.config.conditioning_source,
+            "style_mode": self.config.style_mode,
+            "text_style": self.config.text_style,
+            "text_style_blend": self.config.text_style_blend,
         }
+        if self._render_path is not None:
+            info["rendered_audio"] = str(self._render_path)
+        if self._analysis is not None:
+            info["midi_key"] = self._analysis.key_name
+            info["midi_loop_start_bar"] = int(self._analysis.loop_start_bar)
+            info["midi_loop_bars"] = int(self._analysis.loop_bars)
         if self._audio is not None:
             info["duration_seconds"] = round(self.duration, 3)
             info["sample_rate"] = self.sample_rate

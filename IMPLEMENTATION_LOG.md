@@ -225,12 +225,81 @@ Output `outputs/manual_bpm/manual_bpm_live/`:
 This confirms the live control path end to end, separate from the scripted demo
 scenario. The smoothed BPM follows the 12 BPM/s slew limit rather than jumping.
 
+## 2026-11-10 — Iteration 2: MIDI, heartbeat, mixer
+
+Goal: keep the working prototype, but replace chaotic/vocal MRT2 output with
+three separable layers. The MIDI transcription is the primary reference; the
+MP3 is comparison-only and never mixed in.
+
+New modules:
+
+- `music/midi_analysis.py` — SMF/tempo parsing, key estimation, diatonic
+  bass-anchored Viterbi chords, bars, automatic 16-bar loop, cleaned theme,
+  diagnostics, JSON.
+- `music/midi_render.py` — self-contained numpy synth (bass/pad/lead), loop
+  material, deterministic offline render + cache.
+- `music/arranger.py` — `MidiArranger`, sample-accurate events against the live
+  BPM clock, heartbeat documentation.
+- `audio/synth.py` — `AccompanimentSynth` (pending voices) and
+  `HeartbeatSynth` (BPM-exact lub-dub/tick, rendered in the playback thread).
+- `audio/mixer.py` — `SmoothedGain`, `Limiter`, `LayerMixer`, `RealtimeLayers`.
+
+Modified:
+
+- `config.py` — `ArrangementConfig`, `MixConfig`, new `ReferenceConfig` fields,
+  `drain_on_stop=True`.
+- `audio/playback.py` — optional processor and recorder run in the playback
+  thread; periodic flush; tail drain on stop.
+- `runtime/pipeline.py` — MIDI analysis in `prepare()`, full + reduced
+  (bass/pad only) timelines, arranger events to the synth, heartbeat BPM,
+  mixed-output recording, arrangement/mixer report fields, heartbeat in legacy
+  mode (for the C ablation).
+- `music/reference.py` — MIDI-render conditioning source, style modes, text
+  embedding blend, richer info.
+
+MIDI findings: Eb major (Krumhansl 0.918), 761 notes, 71 chords, 4.49
+onsets/s, median note 0.197 s, 116 non-diatonic notes; single Basic Pitch track
+with no vocal/instrumental split. Auto-selected loop bars 44–59
+(Eb–Ab–Bb–Eb), 64 beats / 32 s, 53 cleaned theme notes. See
+`MIDI_ANALYSIS.md`.
+
+Bugs found and fixed:
+
+1. Tempo-map inversion collapsed the song to 4 beats; `_TempoConverter` now
+   receives the MIDI end tick.
+2. Text/audio MusicCoCa blending produced float64 embeddings, which the tflite
+   tokeniser rejects (`expected FLOAT32`). Masked style fallback was silent.
+   Casting the final embedding to float32 restored 10 style windows.
+3. Recording in the generation thread captured the pre-mix signal; it now runs
+   in the playback thread after `LayerMixer`.
+4. The reserved `drain_on_stop` is now implemented, so the buffered tail is
+   played and recorded.
+
+Validation so far:
+
+- Real MRT2 hybrid run, 12 s, MIDI conditioning, text blend 0.65:
+  10 style windows, MIDI-render prefill installed, 25.5 ms mean / 27.5 ms p95
+  inference, 0 underruns, 0 dropped frames, WAV 12.04 s, peak 0.654, RMS 0.077,
+  0 clipped samples, 13 low-band events at ~62 BPM.
+- Mock A–E runner produces all five configurations and artifacts.
+- Controlled A–E suite rerun at fixed manual BPM 70 (the first demo-scenario
+  suite was discarded as confounded): all five runs completed with 0 clips and
+  0 underruns; full metrics and objective audio features in `EXPERIMENTS.md`.
+- Final real-device hybrid session (`outputs/final_playback/`): 20 s,
+  `sounddevice` audible, peak 0.628, RMS 0.076, 26 heartbeat events, 25.8 ms
+  mean / 27.2 ms p95 inference, 0 underruns, 0 clipped samples, 0 limiter
+  reductions. Detected low-band pulse period 0.7951 s vs expected 0.7947 s.
+- `uv run pytest -q` includes the new `tests/test_music_layers.py` (54 passed).
+
 ## Reproduction
 
 ```bash
 uv run pytest -q
 uv run diastole selftest --full
 uv run diastole demo --duration 42 --no-dashboard --out outputs/final_demo
+# iteration 2
+uv run diastole run --mode hybrid --conditioning midi --duration 42
+uv run diastole experiments --duration 15 --out outputs/experiments
 ```
 
 Known limitations (simulated sensor only, ~1.3 s buffering latency, undrained

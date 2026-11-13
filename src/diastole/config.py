@@ -92,11 +92,25 @@ class ReferenceConfig:
     pitch_register_low: int = 48
     pitch_register_high: int = 76
 
+    # --- iteration-2 conditioning options -----------------------------
+    # "audio"    -> the file at ``audio_path`` (default: the MP3 recording)
+    # "midi"     -> an instrumental rendering of the MIDI, generated on demand
+    conditioning_source: str = "midi"
+    style_mode: str = "fixed"  # drift | fixed | loop
+    style_position_seconds: float = 0.0
+    style_speed: float = 1.0
+    text_style: str = "solo piano and warm strings, instrumental, no vocals"
+    text_style_blend: float = 0.65  # 0 = audio only, 1 = text only
+    text_style_seed: int = 0
+    midi_render_seconds: float = 48.0
+    midi_render_cache: Path = DEFAULT_CACHE_DIR / "reference"
+
     def as_dict(self) -> dict:
         d = dataclasses.asdict(self)
         d["audio_path"] = str(self.audio_path)
         d["midi_path"] = str(self.midi_path)
         d["cache_dir"] = str(self.cache_dir)
+        d["midi_render_cache"] = str(self.midi_render_cache)
         return d
 
 
@@ -156,6 +170,65 @@ class SchedulerConfig:
 
 
 @dataclasses.dataclass(frozen=True)
+class ArrangementConfig:
+    """BPM-locked arrangement of the MIDI-derived musical material.
+
+    ``mode`` selects the behaviour:
+      * ``legacy``  - the original probabilistic timeline (iteration 1);
+      * ``midi``    - deterministic MIDI-derived bass/pad/melody, no heartbeat;
+      * ``hybrid``  - MIDI-derived material plus the deterministic heartbeat.
+    """
+
+    mode: str = "hybrid"
+    heartbeat: bool = True
+    heartbeat_pattern: str = "heartbeat"  # heartbeat | pulse | kick
+    heartbeat_subdivision: int = 2  # ticks per beat; 0 disables ticks
+    accent_every: int = 4  # beats
+    heartbeat_volume_accent: float = 0.22
+    beats_per_bar: int = 4
+    harmonic_rhythm_beats: int = 2
+    enable_bass: bool = True
+    enable_pad: bool = True
+    enable_melody: bool = True
+    melody_density: float = 0.60
+    pad_density: float = 0.90
+    bass_octave: int = 2
+    loop_start_bar: int | None = None
+    loop_bars: int = 16
+    theme_bars: int = 16
+    quantize_beats: float = 0.25
+    humanise_seconds: float = 0.006
+    seed: int = 7
+
+    def as_dict(self) -> dict:
+        return dataclasses.asdict(self)
+
+
+@dataclasses.dataclass(frozen=True)
+class MixConfig:
+    """Per-layer gains, ducking and limiting for the output mixer."""
+
+    heartbeat_gain: float = 0.62
+    accompaniment_gain: float = 0.34
+    mrt2_gain: float = 0.52
+    reference_gain: float = 0.0  # disabled by default
+    master_gain: float = 0.92
+    limiter_threshold: float = 0.94
+    limiter_release_seconds: float = 0.25
+    ducking: float = 0.0  # 0..1; sidechain MRT2/accompaniment from heartbeat
+    duck_attack_seconds: float = 0.008
+    duck_release_seconds: float = 0.22
+    smooth_gain_seconds: float = 0.20
+    record_stems: bool = False
+    reference_audio: Path | None = None
+
+    def as_dict(self) -> dict:
+        d = dataclasses.asdict(self)
+        d["reference_audio"] = str(self.reference_audio) if self.reference_audio else None
+        return d
+
+
+@dataclasses.dataclass(frozen=True)
 class AudioConfig:
     """Playback and recording."""
 
@@ -167,7 +240,7 @@ class AudioConfig:
     buffer_seconds: float = 1.6
     start_threshold_seconds: float = 0.75
     target_fill_fraction: float = 0.85
-    drain_on_stop: bool = False
+    drain_on_stop: bool = True
 
     @property
     def block_frames(self) -> int:
@@ -196,6 +269,8 @@ class RuntimeConfig:
     processor: ProcessorConfig = dataclasses.field(default_factory=ProcessorConfig)
     mapping: MappingConfig = dataclasses.field(default_factory=MappingConfig)
     scheduler: SchedulerConfig = dataclasses.field(default_factory=SchedulerConfig)
+    arrangement: ArrangementConfig = dataclasses.field(default_factory=ArrangementConfig)
+    mix: MixConfig = dataclasses.field(default_factory=MixConfig)
     audio: AudioConfig = dataclasses.field(default_factory=AudioConfig)
     scenario: str = "rest"
     duration: float | None = None
@@ -209,6 +284,8 @@ class RuntimeConfig:
         d["processor"] = self.processor.as_dict()
         d["mapping"] = self.mapping.as_dict()
         d["scheduler"] = self.scheduler.as_dict()
+        d["arrangement"] = self.arrangement.as_dict()
+        d["mix"] = self.mix.as_dict()
         d["audio"] = self.audio.as_dict()
         d["output_dir"] = str(self.output_dir)
         return d

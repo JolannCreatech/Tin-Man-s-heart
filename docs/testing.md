@@ -3,7 +3,7 @@
 ## Unit / integration suite
 
 ```bash
-uv run pytest -q          # 44 tests, ~3 s, no model load
+uv run pytest -q          # 54 tests, ~5 s, no model load
 uv run pytest --cov       # optional coverage
 uv run pytest tests/test_processing.py -q
 ```
@@ -21,9 +21,10 @@ so it never loads the 435 MB model or touches an audio device.
 | `test_ring_buffer.py` | 5 | wraparound, capacity, underruns, clear, fill. |
 | `test_engine.py` | 3 | conditioning layout/offset/masks, mock engine determinism. |
 | `test_reference.py` | 4 | cache index/digest determinism, style window selection, pitch profile fallback. |
-| `test_pipeline.py` | 3 | end-to-end mock session (WAV/MIDI/JSON), manual BPM changes parameters, concurrent `stop()` produces one complete report. |
+| `test_pipeline.py` | 4 | end-to-end mock session (WAV/MIDI/JSON), manual BPM changes parameters, concurrent `stop()` produces one complete report, hybrid mode renders/records the mix. |
+| `test_music_layers.py` | 9 | real MIDI analysis, deterministic render/cache, voice shapes, beat-locked arranger (60/120 BPM), BPM-exact heartbeat, accompaniment scheduling, mixer gains/limiter/reference, gain smoothing. |
 
-The suite includes a real 1.2 s mock pipeline session that asserts continuous
+The suite includes real 1.2 s mock pipeline sessions that assert continuous
 frames, non-silence, exact WAV length, MIDI presence and report contents.
 
 ## Real-model checks
@@ -93,7 +94,30 @@ print(r["audio"])            # peak > 0.01, no NaN, clipped 0
 print(r["validation"])       # all true
 print(r["musical"])          # high-BPM onset/drum rates > low-BPM rates
 print(r["prefill"])          # used, cache_hit, compute/load seconds
+print(r["arrangement"])      # mode, key, loop, chords, mixer layer stats
 ```
+
+### Iteration-2 checks
+
+```bash
+# MIDI material only (no MRT2, no heartbeat)
+uv run diastole run --mock --no-audio --no-dashboard --duration 5 \
+  --mode midi --mrt2-gain 0 --no-heartbeat --out outputs/midi_only
+
+# Heartbeat-only capture at a fixed BPM; verifies Layer A timing
+uv run diastole run --mock --no-audio --no-dashboard --no-reference --duration 10 \
+  --bpm 72 --mode midi --mrt2-gain 0 --accompaniment-gain 0 \
+  --heartbeat-gain 1.0 --master-gain 1.0 --out outputs/heartbeat_only
+
+# Controlled A-E suite
+uv run diastole experiments --duration 15 --bpm 70 --out outputs/experiments
+```
+
+For the heartbeat-only capture, detect low-band peaks and check that intervals
+equal `60 / mapped_tempo`. At raw BPM 72 the mapping gives tempo 76.8, so the
+expected period is 0.78125 s. The verified capture measured a median interval of
+**0.7812 s**, standard deviation **0.0001 s** (CV 0.00013) across 13 thumps —
+i.e. sample-accurate and independent of inference. See `EXPERIMENTS.md`.
 
 Acceptance thresholds used here:
 
@@ -106,6 +130,9 @@ Acceptance thresholds used here:
 | Musical response | high-BPM onset and drum rates clearly exceed low-BPM rates |
 | Continuity | MIDI note/drum events span the session; one WAV/MIDI per session |
 | Reference | style windows > 0 and `prefill.used` true |
+| Heartbeat | `heartbeat_beat_events` > 0; offline period matches mapped tempo |
+| MIDI material | `arrangement.key`, loop and chord list present; render non-silent |
+| Mix safety | 0 clipped samples; limiter is a final guard, not a substitute for gains |
 
 ## Timing note
 

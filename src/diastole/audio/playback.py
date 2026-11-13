@@ -137,11 +137,26 @@ class AudioPlayer:
     runs against the ring buffer without opening a device.  That keeps buffer
     and underrun measurements honest in headless mode (the audio is still
     recorded to WAV by the pipeline).
+
+    ``processor`` (optional) is called in the playback thread as
+    ``processor(block, start_sample) -> mixed_block``; this is where the
+    deterministic heartbeat/accompaniment and limiter run, so they continue
+    even when MRT2 inference stalls.  ``recorder`` (optional) records the
+    processed block, i.e. exactly what is played.
     """
 
-    def __init__(self, config: AudioConfig, ring: RingBuffer) -> None:
+    def __init__(
+        self,
+        config: AudioConfig,
+        ring: RingBuffer,
+        *,
+        processor=None,
+        recorder: WavRecorder | None = None,
+    ) -> None:
         self.config = config
         self.ring = ring
+        self.processor = processor
+        self.recorder = recorder
         self.frames_played = 0
         self.underruns = 0
         self.blocks_played = 0
@@ -154,6 +169,24 @@ class AudioPlayer:
         self._stop_event = threading.Event()
         self._was_underrun = False
         self._last_block_time = 0.0
+        self._flushed_blocks = 0
+
+    def _process(self, samples: np.ndarray) -> np.ndarray:
+        if self.processor is not None:
+            return np.asarray(self.processor(samples, self.frames_played), dtype=np.float32)
+        return samples
+
+    def _emit(self, samples: np.ndarray) -> None:
+        if self._stream is not None:
+            try:
+                self._stream.write(samples)
+            except Exception as exc:  # pragma: no cover - device dependent
+                self.error = f"playback error: {exc}"
+        if self.recorder is not None:
+            self.recorder.write(samples)
+        self.frames_played += samples.shape[0]
+        self._last_block_time = time.monotonic()
+
 
     def start(self) -> None:
         self._stop_event.clear()
@@ -212,21 +245,19 @@ class AudioPlayer:
                         samples[:fade] *= np.linspace(0.0, 1.0, fade, dtype=np.float32)[:, None]
                 self._was_underrun = False
 
-            if self._stream is not None:
-                try:
-                    self._stream.write(samples)
-                except Exception as exc:  # pragma: no cover - device dependent
-                    self.error = f"playback error: {exc}"
-                    break
-            else:
-                # Simulated sink: consume at exactly the device rate.
+            samples = self._process(samples)
+            self._emit(samples)
+
+            if self.recorder is not None and self.blocks_played - self._flushed_blocks >= 50:
+                self.recorder.flush()
+                self._flushed_blocks = self.blocks_played
+
+            # Simulated sink: consume at exactly the device rate.
+            if self._stream is None:
                 elapsed = time.monotonic() - t0
                 sleep_for = block_seconds - elapsed
                 if sleep_for > 0:
                     self._stop_event.wait(sleep_for)
-
-            self.frames_played += samples.shape[0]
-            self._last_block_time = time.monotonic()
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -234,6 +265,8 @@ class AudioPlayer:
         if thread is not None and thread.is_alive():
             thread.join(timeout=3.0)
         self._thread = None
+        if self.config.drain_on_stop:
+            self._drain()
         if self._stream is not None:
             try:
                 self._stream.stop()
@@ -242,6 +275,19 @@ class AudioPlayer:
                 pass
             self._stream = None
         self.active = False
+
+    def _drain(self) -> None:
+        """Play and record the frames still buffered when the session stops."""
+
+        block = self.config.block_frames
+        deadline = time.monotonic() + 10.0
+        while self.ring.available > 0 and time.monotonic() < deadline:
+            frames = min(block, self.ring.available)
+            samples, _ = self.ring.read(frames)
+            samples = self._process(samples)
+            self._emit(samples)
+        if self.recorder is not None:
+            self.recorder.flush()
 
     @property
     def is_audible(self) -> bool:

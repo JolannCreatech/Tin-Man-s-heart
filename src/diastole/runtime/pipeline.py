@@ -26,6 +26,7 @@ from typing import Callable
 import numpy as np
 
 from diastole import config as cfg
+from diastole.audio.mixer import RealtimeLayers
 from diastole.audio.playback import AudioPlayer, RingBuffer, WavRecorder
 from diastole.config import (
     FRAME_SECONDS,
@@ -35,6 +36,8 @@ from diastole.config import (
 )
 from diastole.generation.engine import MRT2Engine, MockEngine
 from diastole.music.adapter import FrameAdapter
+from diastole.music.arranger import MidiArranger
+from diastole.music.midi_analysis import analyze_midi
 from diastole.music.reference import ReferenceMusic
 from diastole.music.timeline import MusicalTimeline, TimelineScheduler
 from diastole.sensors.base import HeartRateSensor, PhysiologicalSample
@@ -212,11 +215,30 @@ class Pipeline:
             self.config.scheduler, profile=self.profile, seed=self.config.seed
         )
         self.timeline = MusicalTimeline()
+        self.cond_timeline = self.timeline
         self.adapter = FrameAdapter(mask_unused_notes=False)
 
+        self.mode = self.config.arrangement.mode
+        self.legacy = self.mode == "legacy"
+        self.analysis = None
+        self.arranger: MidiArranger | None = None
+        self.layers: RealtimeLayers | None = None
+        # The heartbeat is useful on its own, so build the layer stack whenever
+        # it is enabled even if the melodic material still comes from the
+        # iteration-1 scheduler (``legacy`` mode).
+        if not self.legacy or self.config.arrangement.heartbeat:
+            self.layers = RealtimeLayers(
+                self.config.mix, self.config.arrangement, SAMPLE_RATE
+            )
+
         self.ring = RingBuffer(self.config.audio.buffer_frames, self.config.audio.channels)
-        self.player = AudioPlayer(self.config.audio, self.ring)
         self.recorder = WavRecorder()
+        self.player = AudioPlayer(
+            self.config.audio,
+            self.ring,
+            processor=self.layers.process if self.layers is not None else None,
+            recorder=self.recorder,
+        )
         self.metrics = Metrics()
 
         self._stop_event = threading.Event()
@@ -238,6 +260,35 @@ class Pipeline:
 
     # -- preparation ------------------------------------------------------
     def prepare(self) -> None:
+        if not self.legacy:
+            try:
+                self.progress("Analysing MIDI transcription...")
+                self.analysis = analyze_midi(
+                    self.config.reference.midi_path,
+                    loop_bars=self.config.arrangement.loop_bars,
+                )
+                self.analysis.write(self.paths.directory / "midi_analysis.json")
+                self.reference.set_analysis(self.analysis)
+                self.arranger = MidiArranger(
+                    self.analysis, self.config.arrangement, sample_rate=SAMPLE_RATE
+                )
+                self.cond_timeline = MusicalTimeline()
+                self.progress(
+                    f"MIDI: {self.analysis.key_name}, loop bars "
+                    f"{self.analysis.loop_start_bar}-"
+                    f"{self.analysis.loop_start_bar + self.analysis.loop_bars}, "
+                    f"{len(self.analysis.theme)} theme notes"
+                )
+            except Exception as exc:
+                self.progress(
+                    f"MIDI analysis failed, falling back to legacy: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                self.legacy = True
+                if self.layers is not None and not self.config.arrangement.heartbeat:
+                    self.layers = None
+                    self.player.processor = None
+
         if self.use_reference:
             try:
                 self.reference.prepare_style_tokens(progress=self.progress)
@@ -331,14 +382,45 @@ class Pipeline:
         params = self.mapper.map(state)
         audio_time = self._audio_time
 
-        added = self.scheduler.update(audio_time, params, self.timeline)
+        if self.legacy or self.arranger is None:
+            added = self.scheduler.update(audio_time, params, self.timeline)
+            cond_timeline = self.timeline
+            if self.layers is not None:
+                self.layers.set_bpm(params.tempo_bpm)
+        else:
+            self.timeline.set_tempo(audio_time, params.tempo_bpm)
+            self.cond_timeline.set_tempo(audio_time, params.tempo_bpm)
+            events, drums = self.arranger.update(audio_time, params.tempo_bpm)
+            added = len(events) + len(drums)
+            for event in events:
+                velocity = int(min(127, max(1, event.velocity)))
+                self.timeline.add_note(
+                    event.time, event.pitch, event.duration, velocity=velocity
+                )
+                if event.kind in ("bass", "pad"):
+                    self.cond_timeline.add_note(
+                        event.time, event.pitch, event.duration, velocity=velocity
+                    )
+                if self.layers is not None:
+                    self.layers.add_accompaniment(
+                        event.start_sample,
+                        event.kind,
+                        event.pitch,
+                        event.duration,
+                        velocity / 127.0,
+                    )
+            for drum in drums:
+                self.timeline.add_drum(drum.time, drum.note, drum.velocity)
+            if self.layers is not None:
+                self.layers.set_bpm(params.tempo_bpm)
+            cond_timeline = self.cond_timeline
+
         if added:
-            # Approximate the note/drum split from the timeline delta.
             self.metrics.notes_scheduled = self.timeline.note_count
             self.metrics.drums_scheduled = self.timeline.drum_count
 
         style = self._style_tokens(audio_time)
-        cond = self.adapter.conditioning(audio_time, self.timeline, style)
+        cond = self.adapter.conditioning(audio_time, cond_timeline, style)
         samples, latency_ms = self.engine.step(
             cond.style_tokens, cond.frame.notes, (cond.frame.drum,)
         )
@@ -348,7 +430,6 @@ class Pipeline:
         written = self.ring.write(samples)
         if written < samples.shape[0]:
             self.metrics.dropped_frames += samples.shape[0] - written
-        self.recorder.write(samples)
 
         style_index = -1
         if self._style_prepared:
@@ -377,7 +458,6 @@ class Pipeline:
         if self._audio_time - self._last_midi_write >= 2.0:
             try:
                 self.timeline.write_midi(self.paths.midi)
-                self.recorder.flush()
             except Exception as exc:
                 self.progress(f"MIDI snapshot failed: {exc}")
             self._last_midi_write = self._audio_time
@@ -422,6 +502,12 @@ class Pipeline:
                 "prefill": self._prefill_used,
                 "reference_error": self._reference_error,
                 "sensor_status": self.sensor.status.value,
+                "mode": self.mode,
+                "heartbeat_beat": (
+                    round(self.layers.heartbeat.beat, 2)
+                    if self.layers is not None
+                    else None
+                ),
             }
         )
         return snap
@@ -525,6 +611,49 @@ class Pipeline:
         except Exception as exc:
             return {"exists": self.paths.wav.exists(), "error": str(exc)}
 
+    def _arrangement_report(self) -> dict:
+        from diastole.music.midi_render import summary as render_summary
+
+        report: dict = {
+            "mode": self.mode,
+            "heartbeat": bool(self.config.arrangement.heartbeat),
+            "loop_start_bar": None,
+            "loop_bars": int(self.config.arrangement.loop_bars),
+            "layers": self.layers.stats() if self.layers is not None else None,
+        }
+        if self.analysis is not None:
+            report.update(
+                {
+                    "key": self.analysis.key_name,
+                    "key_confidence": round(self.analysis.key_confidence, 4),
+                    "bpm": round(self.analysis.bpm, 3),
+                    "loop_start_bar": int(self.analysis.loop_start_bar),
+                    "chords": [
+                        {
+                            "start_beat": round(c.start_beat, 2),
+                            "end_beat": round(c.end_beat, 2),
+                            "symbol": c.symbol,
+                            "confidence": round(c.confidence, 3),
+                        }
+                        for c in self.analysis.chords
+                        if c.end_beat > self.analysis.loop_start_beat
+                        and c.start_beat
+                        < self.analysis.loop_start_beat + self.analysis.loop_length_beats
+                    ],
+                    "theme_notes": len(self.analysis.theme),
+                    "diagnostics": self.analysis.issues,
+                    "stats": self.analysis.stats,
+                    "render": render_summary(self.analysis),
+                }
+            )
+        if self.arranger is not None:
+            report["arranger"] = {
+                "beat": round(self.arranger.beat, 3),
+                "loop_beats": round(self.arranger.loop_beats, 3),
+                "onsets": len(self.arranger._onsets),
+            }
+        return report
+
     def build_report(self) -> dict:
         frames = self.metrics.frames()
         latency = self.metrics.latency_summary()
@@ -585,6 +714,7 @@ class Pipeline:
             "config": config_dict,
             "engine": self.engine.info(),
             "reference": self.reference.info(),
+            "arrangement": self._arrangement_report(),
             "prefill": {
                 "used": self._prefill_used,
                 "seconds": _round(self._prefill_seconds, 2),
@@ -678,6 +808,11 @@ class Pipeline:
                 "midi_written": self.paths.midi.exists(),
                 "prefilled": self._prefill_used,
                 "audible_output": self.player.is_audible,
+                "mode": self.mode,
+                "heartbeat_layer": bool(
+                    self.layers is not None and self.config.arrangement.heartbeat
+                ),
+                "mixed_layers": self.layers is not None,
             },
             "timeseries": frames,
         }

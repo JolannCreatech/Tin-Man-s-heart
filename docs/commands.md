@@ -102,6 +102,15 @@ uv run diastole run --no-audio --duration 10 --out outputs/record_only
 | `--interactive` | read commands from stdin |
 | `--buffer S` | ring buffer seconds (default 1.6) |
 | `--seed N` | deterministic seed |
+| `--mode legacy\|midi\|hybrid` | iteration-1 scheduler / MIDI accompaniment / MIDI + heartbeat (default hybrid) |
+| `--no-heartbeat` | disable the deterministic heartbeat layer |
+| `--heartbeat-pattern heartbeat\|pulse\|kick` | heartbeat figure |
+| `--heartbeat-gain`, `--accompaniment-gain`, `--mrt2-gain`, `--reference-gain`, `--master-gain` | per-layer mix gains |
+| `--ducking 0..1` | sidechain MRT2/accompaniment from the heartbeat |
+| `--conditioning midi\|audio` | condition MRT2 on the MIDI render (default) or MP3 |
+| `--style-mode fixed\|drift\|loop` | how the MusicCoCa window advances |
+| `--text-style TEXT`, `--text-blend 0..1` | MusicCoCa text style and its blend weight |
+| `--loop-bars N` | MIDI loop length (default 16) |
 | `--temperature`, `--top-k`, `--cfg-notes`, `--cfg-musiccoca`, `--cfg-drums` | MRT2 sampling/CFG controls |
 
 Interactive commands:
@@ -113,14 +122,39 @@ status
 stop
 ```
 
+## `diastole experiments`
+
+Runs the controlled A–E ladder with a fixed manual BPM so the comparison is not
+confounded by the physiological scenario:
+
+| Key | Configuration |
+|---|---|
+| A | iteration-1 baseline (MRT2 from the audio reference, no heartbeat/MIDI material) |
+| B | MIDI analysis only (deterministic instrumental render, MRT2 silent) |
+| C | heartbeat + iteration-1 MRT2 timeline, audio conditioning |
+| D | iteration-1 MRT2 timeline conditioned on the MIDI render + style text |
+| E | full hybrid: heartbeat + MIDI accompaniment + MIDI-conditioned MRT2 |
+
+```bash
+uv run diastole experiments --duration 15 --bpm 70 --out outputs/experiments
+uv run diastole experiments --only A,C,E
+uv run diastole experiments --mock --no-audio --duration 2   # runner check
+```
+
+Each run writes `audio.wav`, `score.mid`, `report.json`, `midi_analysis.json`
+(where applicable), and the suite writes `summary.json` and an
+`EXPERIMENTS.md` table. Where a run uses the MIDI reference, its rendered
+instrumental stem is copied next to the mix for auditioning.
+
 ## Outputs
 
 Each run creates `outputs/<session-name>/` (or under `--out`):
 
 | File | Description |
 |---|---|
-| `audio.wav` | 48 kHz, 16-bit stereo session audio. |
+| `audio.wav` | 48 kHz, 16-bit stereo recording of the mixed output. |
 | `score.mid` | One type-1 SMF for the whole session (tempo map, notes, drums). |
+| `midi_analysis.json` | Key, chords, bars, selected loop, theme and diagnostics. |
 | `report.json` | Full measurements and per-frame time series. |
 | `report.md` | Human-readable summary. |
 
@@ -128,6 +162,8 @@ Each run creates `outputs/<session-name>/` (or under `--out`):
 
 - `session` — name, wall/audio seconds, frames, mock flag.
 - `engine` — model, frame geometry, state size, load/warm-up time, CFG scales.
+- `arrangement` — mode, key/confidence, BPM, loop, chords, theme notes,
+  diagnostics, render summary, arranger state and mixer layer stats.
 - `prefill` — used, original compute seconds, cache-load seconds, cache hit/path,
   style-window count, error.
 - `latency_ms` — mean/p50/p95/max, 40 ms budget, real-time factor.
